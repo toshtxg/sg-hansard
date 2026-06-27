@@ -12,7 +12,9 @@ export function formatNumber(n: number | null | undefined): string {
 
 export function formatDate(d: string | null | undefined): string {
   if (!d) return '—'
-  return new Date(d).toLocaleDateString('en-SG', { year: 'numeric', month: 'short', day: 'numeric' })
+  // sitting_date is a calendar date (no time/zone). Render it in UTC so the day
+  // doesn't shift backwards for viewers in timezones behind UTC.
+  return new Date(d).toLocaleDateString('en-SG', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' })
 }
 
 export function hansardUrl(sittingDate: string): string {
