@@ -12,6 +12,47 @@ export interface RecentSitting {
   source_url: string | null
   speech_count: number
   word_count: number
+  // Optional: only present once the updated recent_sittings RPC is applied.
+  summary_3_sentences?: string | null
+}
+
+export interface SittingPtba {
+  mp_name_cleaned: string
+  ptba_from: string | null
+  ptba_to: string | null
+}
+
+export interface SittingAttendance {
+  present_count: number
+  absent_count: number
+  total: number
+  absent: string[]
+  ptba: SittingPtba[]
+}
+
+export interface SittingSpeech {
+  row_num: number
+  discussion_title: string | null
+  section_type: string
+  mp_name: string | null
+  word_count: number | null
+  one_liner: string | null
+}
+
+export interface SittingDetail {
+  sitting_date: string
+  source_url: string | null
+  summary_3_sentences: string | null
+  attendance: SittingAttendance | null
+  speeches: SittingSpeech[]
+}
+
+export interface MPAttendance {
+  mp_name: string
+  sittings_total: number
+  sittings_present: number
+  attendance_rate: number | null
+  ptba_count: number
 }
 
 export interface MPListItem {

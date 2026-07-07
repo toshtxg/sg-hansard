@@ -129,17 +129,22 @@ export function Overview() {
                   ))
                 : (recentRaw ?? []).map((sitting) => (
                     <div key={sitting.sitting_date} className="flex items-center justify-between p-4">
-                      <div>
-                        <p className="font-medium text-navy">{formatDate(sitting.sitting_date)}</p>
+                      <div className="min-w-0">
+                        <Link to={`/sitting/${sitting.sitting_date}`} className="font-medium text-navy hover:text-teal hover:underline">
+                          {formatDate(sitting.sitting_date)}
+                        </Link>
                         <p className="text-xs text-gray-500 mt-0.5">
                           {formatNumber(sitting.speech_count)} speeches · {formatNumber(sitting.word_count)} words
                         </p>
+                        {sitting.summary_3_sentences && (
+                          <p className="text-xs text-gray-500 mt-1 line-clamp-2">{sitting.summary_3_sentences}</p>
+                        )}
                       </div>
                       <a
                         href={hansardUrl(sitting.sitting_date)}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="p-2 text-teal hover:text-teal-700"
+                        className="p-2 text-teal hover:text-teal-700 shrink-0"
                         aria-label="View Hansard"
                       >
                         <ExternalLink size={18} />
@@ -171,7 +176,22 @@ export function Overview() {
                       ))
                     : (recentRaw ?? []).map((sitting) => (
                         <tr key={sitting.sitting_date} className="border-b hover:bg-gray-50">
-                          <td className="p-4 font-medium">{formatDate(sitting.sitting_date)}</td>
+                          <td className="p-4 font-medium align-top">
+                            <Link
+                              to={`/sitting/${sitting.sitting_date}`}
+                              className="text-navy hover:text-teal hover:underline"
+                            >
+                              {formatDate(sitting.sitting_date)}
+                            </Link>
+                            {sitting.summary_3_sentences && (
+                              <p
+                                className="text-xs font-normal text-gray-500 mt-1 line-clamp-1 max-w-md"
+                                title={sitting.summary_3_sentences}
+                              >
+                                {sitting.summary_3_sentences}
+                              </p>
+                            )}
+                          </td>
                           <td className="p-4 text-right text-gray-700">{formatNumber(sitting.speech_count)}</td>
                           <td className="p-4 text-right text-gray-700">{formatNumber(sitting.word_count)}</td>
                           <td className="p-4 text-center">

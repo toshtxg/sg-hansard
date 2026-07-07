@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Search, ChevronDown, ChevronRight, ExternalLink } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -21,16 +22,37 @@ function useDebounce(value: string, delay: number): string {
 }
 
 export function TopicExplorer() {
-  const [search, setSearch] = useState('')
-  const [dateFrom, setDateFrom] = useState('')
-  const [dateTo, setDateTo] = useState('')
-  const [selectedSections, setSelectedSections] = useState<string[]>([])
-  const [selectedParliament, setSelectedParliament] = useState<number | null>(null)
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  // Initialise filter state from the URL so filtered views are shareable.
+  const [search, setSearch] = useState(() => searchParams.get('q') ?? '')
+  const [dateFrom, setDateFrom] = useState(() => searchParams.get('from') ?? '')
+  const [dateTo, setDateTo] = useState(() => searchParams.get('to') ?? '')
+  const [selectedSections, setSelectedSections] = useState<string[]>(() => {
+    const raw = searchParams.get('types')
+    return raw ? raw.split(',').filter(Boolean) : []
+  })
+  const [selectedParliament, setSelectedParliament] = useState<number | null>(() => {
+    const raw = searchParams.get('parl')
+    return raw ? Number(raw) : null
+  })
   const [expandedRow, setExpandedRow] = useState<string | null>(null)
   const [expandedDetail, setExpandedDetail] = useState<TopicDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
 
   const debouncedSearch = useDebounce(search, 300)
+
+  // Keep the URL in sync with the filters (replace, not push, so typing doesn't
+  // spam the history stack).
+  useEffect(() => {
+    const next = new URLSearchParams()
+    if (search) next.set('q', search)
+    if (dateFrom) next.set('from', dateFrom)
+    if (dateTo) next.set('to', dateTo)
+    if (selectedSections.length > 0) next.set('types', selectedSections.join(','))
+    if (selectedParliament !== null) next.set('parl', String(selectedParliament))
+    setSearchParams(next, { replace: true })
+  }, [search, dateFrom, dateTo, selectedSections, selectedParliament, setSearchParams])
 
   const rpcParams: Record<string, unknown> = {
     p_query: debouncedSearch || null,

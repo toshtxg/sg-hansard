@@ -38,10 +38,12 @@ RETURNS json AS $$
   SELECT json_agg(r) FROM (
     SELECT s.sitting_date, s.source_url,
       COUNT(sp.row_num) as speech_count,
-      COALESCE(SUM(sp.word_count), 0) as word_count
+      COALESCE(SUM(sp.word_count), 0) as word_count,
+      ai.summary_3_sentences
     FROM hansard_sittings s
     LEFT JOIN hansard_speeches sp ON s.sitting_date = sp.sitting_date
-    GROUP BY s.sitting_date, s.source_url
+    LEFT JOIN hansard_ai_summaries ai ON s.sitting_date = ai.sitting_date
+    GROUP BY s.sitting_date, s.source_url, ai.summary_3_sentences
     ORDER BY s.sitting_date DESC
     LIMIT p_limit
   ) r;
@@ -256,8 +258,8 @@ $$ LANGUAGE sql STABLE;
 CREATE OR REPLACE FUNCTION trends_speaker_diversity(p_granularity text DEFAULT 'year')
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY period) FROM (
-    SELECT 
-      CASE WHEN p_granularity = 'year' 
+    SELECT
+      CASE WHEN p_granularity = 'year'
         THEN date_trunc('year', sitting_date)::date::text
         ELSE date_trunc('quarter', sitting_date)::date::text
       END as period,
@@ -267,4 +269,92 @@ RETURNS json AS $$
     WHERE mp_name_fuzzy_matched IS NOT NULL
     GROUP BY period
   ) r;
+$$ LANGUAGE sql STABLE;
+
+-- =============================================================
+-- 2026 ADDITIONS: sitting detail, MP attendance, AI summaries
+-- (Appended section — apply this whole file in Supabase SQL Editor.)
+-- =============================================================
+
+-- Supporting indexes for the new attendance / PTBA lookups.
+-- (hansard_ai_summaries.sitting_date is already covered by its PK, so no index there.)
+CREATE INDEX IF NOT EXISTS idx_attendance_mp_name_cleaned ON hansard_attendance (mp_name_cleaned);
+CREATE INDEX IF NOT EXISTS idx_ptba_mp_name_cleaned ON hansard_ptba (mp_name_cleaned);
+
+-- Full detail for a single sitting: metadata + AI summary + attendance + speeches.
+CREATE OR REPLACE FUNCTION sitting_detail(p_sitting_date date)
+RETURNS json AS $$
+  SELECT json_build_object(
+    'sitting_date', p_sitting_date,
+    'source_url', (SELECT source_url FROM hansard_sittings WHERE sitting_date = p_sitting_date),
+    'summary_3_sentences', (
+      SELECT summary_3_sentences FROM hansard_ai_summaries WHERE sitting_date = p_sitting_date
+    ),
+    'attendance', (
+      SELECT json_build_object(
+        'present_count', COUNT(*) FILTER (WHERE dim_is_present),
+        'absent_count', COUNT(*) FILTER (WHERE NOT dim_is_present),
+        'total', COUNT(*),
+        'absent', COALESCE(
+          (SELECT json_agg(mp_name_cleaned ORDER BY mp_name_cleaned)
+           FROM hansard_attendance
+           WHERE sitting_date = p_sitting_date AND NOT dim_is_present),
+          '[]'::json
+        ),
+        'ptba', COALESCE(
+          (SELECT json_agg(json_build_object(
+              'mp_name_cleaned', mp_name_cleaned,
+              'ptba_from', ptba_from,
+              'ptba_to', ptba_to
+            ) ORDER BY mp_name_cleaned)
+           FROM hansard_ptba
+           WHERE sitting_date = p_sitting_date),
+          '[]'::json
+        )
+      )
+      FROM hansard_attendance
+      WHERE sitting_date = p_sitting_date
+    ),
+    'speeches', COALESCE(
+      (SELECT json_agg(json_build_object(
+          'row_num', row_num,
+          'discussion_title', discussion_title,
+          'section_type', section_type,
+          'mp_name', COALESCE(mp_name_fuzzy_matched, mp_name_raw),
+          'word_count', word_count,
+          'one_liner', one_liner
+        ) ORDER BY row_num)
+       FROM hansard_speeches
+       WHERE sitting_date = p_sitting_date),
+      '[]'::json
+    )
+  );
+$$ LANGUAGE sql STABLE;
+
+-- Attendance summary for a single MP (joined on the cleaned attendance name).
+-- attendance_rate is returned as a 0-1 fraction rounded to 3 dp.
+CREATE OR REPLACE FUNCTION mp_attendance(p_mp_name text)
+RETURNS json AS $$
+  SELECT json_build_object(
+    'mp_name', p_mp_name,
+    'sittings_total', (
+      SELECT COUNT(*) FROM hansard_attendance WHERE mp_name_cleaned = p_mp_name
+    ),
+    'sittings_present', (
+      SELECT COUNT(*) FROM hansard_attendance
+      WHERE mp_name_cleaned = p_mp_name AND dim_is_present
+    ),
+    'attendance_rate', (
+      SELECT ROUND(
+        COUNT(*) FILTER (WHERE dim_is_present)::numeric
+          / NULLIF(COUNT(*), 0),
+        3
+      )
+      FROM hansard_attendance
+      WHERE mp_name_cleaned = p_mp_name
+    ),
+    'ptba_count', (
+      SELECT COUNT(*) FROM hansard_ptba WHERE mp_name_cleaned = p_mp_name
+    )
+  );
 $$ LANGUAGE sql STABLE;

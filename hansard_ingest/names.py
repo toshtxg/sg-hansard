@@ -208,10 +208,20 @@ def clean_mp_name_from_attendance(raw: str) -> Optional[str]:
         return None
     s = str(raw).strip().rstrip(".")
 
-    # Special case: 'Mr SPEAKER (Mr Seah Kian Peng (Marine Parade)).'
-    # IMPORTANT: do NOT trigger for 'Deputy Speaker' attendance lines.
+    # Special case: presiding-officer attendance lines nest the person's real
+    # name in parentheses, e.g.
+    #   'Mr SPEAKER (Mr Seah Kian Peng (Marine Parade)).'
+    #   'Mr Deputy Speaker (Mr Christopher de Souza (Holland-Bukit Timah)).'
+    # extract_person_from_speaker_attendance() reads the OUTERMOST parentheses,
+    # so it correctly strips the doubly-nested constituency. For the Deputy
+    # Speaker variant we only take this path when a person (honorific-prefixed)
+    # is actually nested, to avoid misreading a bare '(Constituency)' as a name.
     u = s.upper()
-    if "DEPUTY SPEAKER" not in u and re.search(r"\bSPEAKER\s*\(", s, flags=re.I):
+    is_speaker_paren = "DEPUTY SPEAKER" not in u and re.search(r"\bSPEAKER\s*\(", s, flags=re.I)
+    is_deputy_person = "DEPUTY SPEAKER" in u and re.search(
+        r"\bSPEAKER\s*\(\s*%s\b" % HONORIFICS_RE, s, flags=re.I
+    )
+    if is_speaker_paren or is_deputy_person:
         sp = extract_person_from_speaker_attendance(s)
         if sp:
             return sp
