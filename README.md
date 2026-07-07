@@ -3,7 +3,7 @@
 Ingestion pipeline for Singapore Parliament Hansard transcripts. Pulls each
 sitting's JSON from the Parliament API, parses attendance / PTBA / speeches
 out of the embedded HTML, optionally generates AI summaries, and upserts
-everything into Supabase. A weekly GitHub Actions cron keeps the database
+everything into Supabase. A daily GitHub Actions cron keeps the database
 current; the parsed data backs a separate React dashboard.
 
 > **PTBA** = *Permission To Be Absent*, the formal mechanism by which Members
@@ -112,15 +112,22 @@ for a starter file. Key variables:
 
 ### Date range / control flow
 
-| Variable             | Default                                  | Notes                                                              |
-| -------------------- | ---------------------------------------- | ------------------------------------------------------------------ |
-| `RUN_DATE`           | _unset_                                  | Single-date run. Accepts `YYYY-MM-DD` or `DD-MM-YYYY`              |
-| `START_DATE`         | day after the latest sitting in Supabase | ISO date. Falls back to `2020-01-01` if the table is empty         |
-| `END_DATE`           | today                                    | ISO date                                                           |
-| `MAX_DAYS_PER_RUN`   | `0` (disabled)                           | Safety cap per run (handy on Actions). Set to e.g. `30`            |
-| `SKIP_DB`            | `false`                                  | Parse only, never call Supabase                                    |
-| `DEBUG`              | `false`                                  | Verbose logs + write per-sitting CSVs                              |
-| `SAVE_JSON`          | `false`                                  | When `DEBUG=true`, also dump raw API JSON to disk                  |
+| Variable               | Default                                  | Notes                                                              |
+| ---------------------- | ---------------------------------------- | ------------------------------------------------------------------ |
+| `RUN_DATE`             | _unset_                                  | Single-date run. Accepts `YYYY-MM-DD` or `DD-MM-YYYY`              |
+| `START_DATE`           | lookback window from the latest sitting  | ISO date. Falls back to `2020-01-01` if the table is empty         |
+| `END_DATE`             | today                                    | ISO date                                                           |
+| `INGEST_LOOKBACK_DAYS` | `7`                                      | When `START_DATE` is unset, re-ingest this many days back from (and including) the latest sitting in Supabase. Retries transiently-failed days and picks up post-publication Hansard revisions; upserts are idempotent so this is safe |
+| `FETCH_SLEEP_SECS`     | `1`                                      | Politeness delay (seconds) between per-day fetches                 |
+| `MAX_DAYS_PER_RUN`     | `0` (disabled)                           | Safety cap per run (handy on Actions). Set to e.g. `30`            |
+| `SKIP_DB`              | `false`                                  | Parse only, never call Supabase                                    |
+| `DEBUG`                | `false`                                  | Verbose logs + write per-sitting CSVs                              |
+| `SAVE_JSON`            | `false`                                  | When `DEBUG=true`, also dump raw API JSON to disk                  |
+
+The fetch layer also retries transient HTTP errors (429/5xx) with exponential
+backoff, and the run ends with a one-line summary. If any day fails to fetch,
+parse, or upsert, the process exits non-zero so the GitHub Action turns red
+and notifies the owner. Non-sitting days (empty payloads) are not failures.
 
 ### AI summaries (optional)
 
@@ -132,6 +139,7 @@ for a starter file. Key variables:
 | `OPENAI_MODEL`    | `gpt-4o-mini`   | Used for both sitting and per-speech summaries         |
 | `AI_MAX_CHARS`    | `12000`         | Hard cap on the sitting-summary prompt size            |
 | `AI_DRY_RUN`      | `false`         | Generate but do not persist summaries                  |
+| `AI_FORCE`        | `false`         | Re-generate sitting summaries even when one already exists. By default dates with an existing `hansard_ai_summaries` row are skipped, so the daily lookback window doesn't re-pay for summaries |
 
 ---
 
@@ -165,8 +173,22 @@ python scripts/backfill_summaries.py \
 ### Scheduled runs (GitHub Actions)
 
 [`.github/workflows/hansard_ingest.yml`](.github/workflows/hansard_ingest.yml)
-runs every Monday 16:00 UTC (Tue 00:00 SGT). Set the following repository
+runs daily at 16:00 UTC (00:00 SGT) — Hansard data is published next-day, and
+the `INGEST_LOOKBACK_DAYS` window keeps daily runs cheap while retrying any
+recently-failed days. A failed day makes the run exit non-zero, so the Action
+turns red and GitHub notifies the owner. Set the following repository
 secrets: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt   # installs requirements.txt + pytest
+pytest
+```
+
+Unit tests live in [`tests/`](tests/) and cover name cleaning, parsing,
+per-speech summary plumbing, and the date/JSON helpers. `pytest.ini` puts the
+repo root on `sys.path` so `import hansard_ingest` works without installation.
 
 ---
 
@@ -176,9 +198,11 @@ secrets: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_API_KEY`.
 sg-hansard/
 ├── ingest.py                      # CLI entrypoint → hansard_ingest.main.ingest()
 ├── requirements.txt
+├── requirements-dev.txt           # test deps (pytest)
+├── pytest.ini
 ├── .env.example
 ├── .github/workflows/
-│   └── hansard_ingest.yml         # Weekly cron
+│   └── hansard_ingest.yml         # Daily cron
 ├── db/
 │   └── dashboard_rpcs.sql         # Supabase RPCs + indexes for the dashboard
 ├── hansard_ingest/                # Ingestion package
@@ -191,6 +215,7 @@ sg-hansard/
 │   ├── ai_speech_summary.py       # Per-speech structured summary (optional)
 │   ├── utils.py                   # Date / JSON / CSV helpers
 │   └── main.py                    # Orchestration loop
+├── tests/                         # pytest unit tests
 └── scripts/
     ├── backfill_existing_sittings.py
     └── backfill_summaries.py

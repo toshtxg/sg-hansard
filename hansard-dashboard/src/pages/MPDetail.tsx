@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { useSupabaseRpc } from '@/hooks/useSupabaseRpc'
 import { supabase } from '@/lib/supabase'
-import type { MPSummary, MPActivityPoint, MPTopic, MPSectionBreakdown, MPDiscussion, TopicDetail } from '@/lib/types'
+import type { MPSummary, MPActivityPoint, MPTopic, MPSectionBreakdown, MPDiscussion, TopicDetail, MPAttendance } from '@/lib/types'
 import { formatNumber, formatDate, sectionTypeLabel, hansardUrl, cn } from '@/lib/utils'
 
 const CHART_COLORS = ['#0d9488', '#3b82f6', '#8b5cf6', '#f59e0b', '#ef4444', '#10b981', '#6366f1']
@@ -41,6 +41,11 @@ export function MPDetail() {
 
   const { data: summary, loading: summaryLoading, error: summaryError, refetch: refetchSummary } =
     useSupabaseRpc<MPSummary>('mp_summary', { p_mp_name: mpName }, deps)
+
+  // Attendance card. If the RPC isn't applied in Supabase yet it will error —
+  // in that case we hide the card entirely (no error box).
+  const { data: attendance, error: attendanceError } =
+    useSupabaseRpc<MPAttendance>('mp_attendance', { p_mp_name: mpName }, deps)
 
   const { data: activity, loading: activityLoading, error: activityError, refetch: refetchActivity } =
     useSupabaseRpc<MPActivityPoint[]>(
@@ -156,6 +161,46 @@ export function MPDetail() {
           </Card>
         </div>
       ) : null}
+
+      {/* Section A2: Attendance (hidden when the RPC isn't available yet) */}
+      {!attendanceError && attendance && attendance.sittings_total > 0 && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">Attendance Rate</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-3xl font-bold text-navy">
+                {attendance.attendance_rate != null ? `${Math.round(attendance.attendance_rate * 100)}%` : '—'}
+              </p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">Sittings Present</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-3xl font-bold text-navy">{formatNumber(attendance.sittings_present)}</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">Sittings Recorded</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-3xl font-bold text-navy">{formatNumber(attendance.sittings_total)}</p>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">Approved Leave (PTBA)</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-3xl font-bold text-navy">{formatNumber(attendance.ptba_count)}</p>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* Section B: Activity Over Time */}
       <Card>

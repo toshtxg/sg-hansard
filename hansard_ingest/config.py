@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bump when changing behaviour so logs make it clear which version ran.
-SCRIPT_VERSION = "2026-01-20.5"
+SCRIPT_VERSION = "2026-07-05.6"
 
 BASE_URL = "https://sprs.parl.gov.sg/search/getHansardReport/"
 
@@ -46,6 +46,15 @@ END_DATE_ISO = env_str("END_DATE", "")
 # Optional safety cap per run (good for GitHub Actions). Set to 0 to disable.
 MAX_DAYS_PER_RUN = env_int("MAX_DAYS_PER_RUN", 0)
 
+# When auto-resuming from the latest sitting in the DB, re-ingest this many days
+# back from (and including) the latest sitting. This retries days that failed
+# transiently and picks up post-publication revisions to recent Hansards.
+# Upserts are idempotent so re-processing is safe.
+INGEST_LOOKBACK_DAYS = env_int("INGEST_LOOKBACK_DAYS", 7)
+
+# Politeness delay (seconds) between per-day fetches.
+FETCH_SLEEP_SECS = env_int("FETCH_SLEEP_SECS", 1)
+
 # Supabase
 SUPABASE_URL = env_str("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = env_str("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -63,3 +72,6 @@ OPENAI_API_KEY = env_str("OPENAI_API_KEY", "")
 OPENAI_MODEL = env_str("OPENAI_MODEL", "gpt-4o-mini")
 AI_MAX_CHARS = env_int("AI_MAX_CHARS", 12000)
 AI_DRY_RUN = env_bool("AI_DRY_RUN", False)  # if true, generate summary but don't write to DB
+# Re-generate sitting summaries even when a row already exists. Off by default so
+# the daily lookback window doesn't re-pay for summaries it already has.
+AI_FORCE = env_bool("AI_FORCE", False)

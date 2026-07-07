@@ -65,6 +65,25 @@ def get_latest_sitting(sb: Client) -> Optional[date]:
     return None
 
 
+def ai_summary_exists(sb: Client, sitting_iso: str) -> bool:
+    """Return True if hansard_ai_summaries already has a row for this date.
+
+    Best-effort: if the table is missing or the query fails, return False so the
+    caller falls back to generating (the upsert path is itself fault-tolerant).
+    """
+    try:
+        resp = (
+            sb.table("hansard_ai_summaries")
+            .select("sitting_date")
+            .eq("sitting_date", sitting_iso)
+            .limit(1)
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception:
+        return False
+
+
 def summarize_speeches_for_date(sb: Client, sitting_iso: str) -> None:
     if not AI_ENABLED or AI_DRY_RUN:
         return
@@ -220,6 +239,23 @@ def upsert_all(
                 raise RuntimeError(f"Upsert failed for hansard_speeches ({sitting_iso}): {e2}")
         else:
             raise RuntimeError(f"Upsert failed for hansard_speeches ({sitting_iso}): {e}")
+
+    # Delete stale speech rows for this sitting: if a re-ingest of the same date
+    # produced fewer rows than a previous run (e.g. a Hansard revision), rows
+    # beyond the current max row_num would otherwise linger. Best-effort only —
+    # never fail the ingest over cleanup.
+    if df_speech_u is not None and not df_speech_u.empty and "row_num" in df_speech_u.columns:
+        try:
+            max_row_num = int(df_speech_u["row_num"].max())
+            (
+                sb.table("hansard_speeches")
+                .delete()
+                .eq("sitting_date", sitting_iso)
+                .gt("row_num", max_row_num)
+                .execute()
+            )
+        except Exception as e:
+            print(f"Stale speech cleanup skipped for {sitting_iso}: {e}")
 
     try:
         sb.table("hansard_sittings").upsert(
