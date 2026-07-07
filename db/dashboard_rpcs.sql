@@ -358,3 +358,30 @@ RETURNS json AS $$
     )
   );
 $$ LANGUAGE sql STABLE;
+
+-- =============================================================
+-- GRANTS — the dashboard's anon role needs read access to the tables,
+-- because the RPCs above are SECURITY INVOKER (the default): they run
+-- with the caller's privileges. Re-running CREATE OR REPLACE resets any
+-- previously SECURITY DEFINER functions to INVOKER, so keep these grants
+-- applied. All data here is public parliamentary record; writes still
+-- require the service role key.
+-- =============================================================
+GRANT SELECT ON hansard_sittings, hansard_attendance, hansard_ptba,
+  hansard_speeches, hansard_ai_summaries TO anon;
+
+-- RLS read policies — the tables have Row Level Security enabled, and the
+-- RPCs run as the caller (SECURITY INVOKER), so anon needs an explicit
+-- SELECT policy on each table or every query returns zero rows. The data
+-- is public parliamentary record; writes are unaffected (service role
+-- bypasses RLS).
+DROP POLICY IF EXISTS "public read" ON hansard_sittings;
+CREATE POLICY "public read" ON hansard_sittings FOR SELECT TO anon USING (true);
+DROP POLICY IF EXISTS "public read" ON hansard_attendance;
+CREATE POLICY "public read" ON hansard_attendance FOR SELECT TO anon USING (true);
+DROP POLICY IF EXISTS "public read" ON hansard_ptba;
+CREATE POLICY "public read" ON hansard_ptba FOR SELECT TO anon USING (true);
+DROP POLICY IF EXISTS "public read" ON hansard_speeches;
+CREATE POLICY "public read" ON hansard_speeches FOR SELECT TO anon USING (true);
+DROP POLICY IF EXISTS "public read" ON hansard_ai_summaries;
+CREATE POLICY "public read" ON hansard_ai_summaries FOR SELECT TO anon USING (true);
