@@ -27,7 +27,9 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           DEBUG: "false"
           SAVE_JSON: "false"
-          MAX_DAYS_PER_RUN: "0"
+          # Cap the rolling window at the most recent 21 days so a long recess
+          # or an upstream outage can't balloon the run into hundreds of days.
+          MAX_DAYS_PER_RUN: "21"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_ENABLED: "true"
           AI_PROVIDER: "openai"
