@@ -17,6 +17,7 @@ from .config import (
     AI_DRY_RUN,
     AI_ENABLED,
     AI_FORCE,
+    ALERT_ON_TOTAL_BLACKOUT,
     DEBUG,
     FETCH_SLEEP_SECS,
     SAVE_JSON,
@@ -84,6 +85,7 @@ def ingest():
 
     days_scanned = 0
     sittings_ingested = 0
+    successful_fetches = 0          # days upstream returned any payload (incl. empty non-sitting)
     fetch_failures: list[str] = []  # transient upstream (5xx/timeout) — self-heals, don't page
     hard_failures: list[str] = []   # parse/DB/unexpected — real problems that should page
 
@@ -109,6 +111,10 @@ def ingest():
             d += timedelta(days=1)
             time.sleep(FETCH_SLEEP_SECS)
             continue
+
+        # Upstream is reachable for this day (an empty payload still counts —
+        # non-sitting days return an empty 200). Used to detect a total blackout.
+        successful_fetches += 1
 
         if DEBUG and SAVE_JSON:
             maybe_write_json(data, f"hansard_{ddmmyyyy}.json")
@@ -190,6 +196,23 @@ def ingest():
             f"WARNING: {len(fetch_failures)} day(s) failed to fetch from upstream "
             f"and will be retried next run: {', '.join(fetch_failures)}"
         )
+
+    # Optional backstop against a *permanent* upstream break (e.g. the endpoint
+    # moves) silently going green forever. A total blackout is a run that scanned
+    # days, had upstream failures, and got zero successful fetches — distinct from
+    # a recess, where fetches succeed but return empty payloads. Off by default
+    # (a normal transient outage would otherwise trip it); opt in via
+    # ALERT_ON_TOTAL_BLACKOUT once you want to be paged on a sustained blackout.
+    total_blackout = (
+        days_scanned > 0 and successful_fetches == 0 and len(fetch_failures) > 0
+    )
+    if ALERT_ON_TOTAL_BLACKOUT and total_blackout and not hard_failures:
+        print(
+            "ALERT: total upstream blackout — every one of "
+            f"{days_scanned} scanned day(s) failed to fetch and none succeeded. "
+            "Upstream may be down or the endpoint may have changed."
+        )
+        sys.exit(1)
 
     if hard_failures:
         # Parse/DB/unexpected errors are real problems: exit non-zero so the

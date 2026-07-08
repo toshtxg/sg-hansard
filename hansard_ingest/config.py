@@ -57,6 +57,12 @@ INGEST_LOOKBACK_DAYS = env_int("INGEST_LOOKBACK_DAYS", 7)
 # Politeness delay (seconds) between per-day fetches.
 FETCH_SLEEP_SECS = env_int("FETCH_SLEEP_SECS", 1)
 
+# Backstop alarm: when true, a run where every scanned day failed to fetch and
+# none succeeded (a total upstream blackout, distinct from a recess) exits
+# non-zero so the GitHub Action turns red. Off by default so ordinary transient
+# outages stay green; opt in to be paged on a sustained/permanent break.
+ALERT_ON_TOTAL_BLACKOUT = env_bool("ALERT_ON_TOTAL_BLACKOUT", False)
+
 # Supabase
 SUPABASE_URL = env_str("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = env_str("SUPABASE_SERVICE_ROLE_KEY", "")
