@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 .env
+.claude/
 
 # Codex chat/context scratch files
 chat-handoff.md
