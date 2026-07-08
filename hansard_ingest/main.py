@@ -10,6 +10,8 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 
+import requests
+
 from .ai_summary import generate_ai_summary
 from .config import (
     AI_DRY_RUN,
@@ -48,7 +50,9 @@ def ingest():
 
         if START_DATE_ISO:
             start_dt = datetime.strptime(START_DATE_ISO, "%Y-%m-%d").date()
+            explicit_start = True
         else:
+            explicit_start = False
             latest = get_latest_sitting(sb) if sb is not None else None
             if latest:
                 # Re-ingest a rolling window ending at (and including) the latest
@@ -60,9 +64,16 @@ def ingest():
                 start_dt = date(2020, 1, 1)
 
         # Optional cap per run (GitHub Actions friendly). Set MAX_DAYS_PER_RUN=0 to disable.
+        # Explicit backfills march forward from the start date; the auto/rolling
+        # window keeps the most recent MAX_DAYS_PER_RUN days ending at end_dt, so a
+        # long recess (a stale latest sitting) can't balloon the window into
+        # hundreds of mostly-non-sitting days that each pay upstream retry backoff.
         if MAX_DAYS_PER_RUN and MAX_DAYS_PER_RUN > 0:
             if (end_dt - start_dt).days + 1 > MAX_DAYS_PER_RUN:
-                end_dt = start_dt + timedelta(days=MAX_DAYS_PER_RUN - 1)
+                if explicit_start:
+                    end_dt = start_dt + timedelta(days=MAX_DAYS_PER_RUN - 1)
+                else:
+                    start_dt = end_dt - timedelta(days=MAX_DAYS_PER_RUN - 1)
 
     print(
         "Ingest range: "
@@ -73,7 +84,8 @@ def ingest():
 
     days_scanned = 0
     sittings_ingested = 0
-    failures: list[str] = []
+    fetch_failures: list[str] = []  # transient upstream (5xx/timeout) — self-heals, don't page
+    hard_failures: list[str] = []   # parse/DB/unexpected — real problems that should page
 
     d = start_dt
     while d <= end_dt:
@@ -82,9 +94,18 @@ def ingest():
 
         try:
             data = fetch_hansard_json(ddmmyyyy)
+        except requests.exceptions.RequestException as e:
+            # Transient upstream error (5xx after retries, timeout, connection
+            # reset). The rolling lookback window retries these on the next run,
+            # so treat as a warning rather than failing the whole job.
+            print(f"Fetch failed (upstream) for {ddmmyyyy}: {e}")
+            fetch_failures.append(ddmmyyyy)
+            d += timedelta(days=1)
+            time.sleep(FETCH_SLEEP_SECS)
+            continue
         except Exception as e:
-            print(f"Fetch failed for {ddmmyyyy}: {e}")
-            failures.append(ddmmyyyy)
+            print(f"Fetch failed (unexpected) for {ddmmyyyy}: {e}")
+            hard_failures.append(ddmmyyyy)
             d += timedelta(days=1)
             time.sleep(FETCH_SLEEP_SECS)
             continue
@@ -96,7 +117,7 @@ def ingest():
             df_att, df_ptba, df_speech, source_url, parliament_no, sitting_dt = parse_one_sitting(data)
         except Exception as e:
             print(f"Parse failed for {ddmmyyyy}: {e}")
-            failures.append(ddmmyyyy)
+            hard_failures.append(ddmmyyyy)
             d += timedelta(days=1)
             time.sleep(FETCH_SLEEP_SECS)
             continue
@@ -147,7 +168,7 @@ def ingest():
                 sittings_ingested += 1
             except Exception as e:
                 print(f"DB insert failed for {ddmmyyyy}: {e}")
-                failures.append(ddmmyyyy)
+                hard_failures.append(ddmmyyyy)
 
         d += timedelta(days=1)
         time.sleep(FETCH_SLEEP_SECS)
@@ -155,12 +176,22 @@ def ingest():
     # ---- Run summary ----
     summary = (
         f"Run summary: days_scanned={days_scanned}, sittings_ingested={sittings_ingested}, "
-        f"failures={len(failures)}"
+        f"upstream_failures={len(fetch_failures)}, hard_failures={len(hard_failures)}"
     )
-    if failures:
-        summary += f" ({', '.join(failures)})"
+    if hard_failures:
+        summary += f" (hard: {', '.join(hard_failures)})"
     print(summary)
 
-    if failures:
-        # Exit non-zero so the GitHub Action turns red and notifies the owner.
+    if fetch_failures:
+        # Upstream (sprs.parl.gov.sg) returned 5xx/timeouts for these days. This is
+        # common during recess or upstream maintenance and self-heals via the
+        # rolling lookback window, so warn but do not fail the job.
+        print(
+            f"WARNING: {len(fetch_failures)} day(s) failed to fetch from upstream "
+            f"and will be retried next run: {', '.join(fetch_failures)}"
+        )
+
+    if hard_failures:
+        # Parse/DB/unexpected errors are real problems: exit non-zero so the
+        # GitHub Action turns red and notifies the owner.
         sys.exit(1)

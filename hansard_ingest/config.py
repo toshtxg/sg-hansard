@@ -44,7 +44,9 @@ START_DATE_ISO = env_str("START_DATE", "")
 END_DATE_ISO = env_str("END_DATE", "")
 
 # Optional safety cap per run (good for GitHub Actions). Set to 0 to disable.
-MAX_DAYS_PER_RUN = env_int("MAX_DAYS_PER_RUN", 0)
+# For the auto/rolling window this keeps the most recent N days ending today;
+# for an explicit START_DATE backfill it marches forward N days from the start.
+MAX_DAYS_PER_RUN = env_int("MAX_DAYS_PER_RUN", 21)
 
 # When auto-resuming from the latest sitting in the DB, re-ingest this many days
 # back from (and including) the latest sitting. This retries days that failed
