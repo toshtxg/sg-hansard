@@ -7,6 +7,7 @@ columns and drop in-payload duplicates before upserting to avoid the
 Postgres error that fires when one statement carries duplicate keys.
 """
 
+import time
 from datetime import date, datetime
 from typing import Optional
 
@@ -56,6 +57,62 @@ def supabase_client() -> Client:
             "Python package 'supabase' is not installed. Install it with: pip install supabase"
         )
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+
+# ---- Transient DB error handling -------------------------------------------
+# A Postgres statement timeout (SQLSTATE 57014) or a dropped connection is a
+# passing blip — the DB was momentarily slow/busy — not a data problem. We give
+# these the same resilience main.ingest() gives transient upstream fetches:
+# retry with backoff, and only escalate to a hard (job-failing) error if every
+# attempt fails. Without this, a single slow upsert turns the whole run red even
+# though the day self-heals on the next lookback pass.
+DB_MAX_RETRIES = 3
+DB_RETRY_BASE_SLEEP_SECS = 2.0
+_TRANSIENT_DB_SIGNATURES = (
+    "57014",                          # canceling statement due to statement timeout
+    "statement timeout",
+    "server closed the connection",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "connection timed out",
+    "read timed out",
+    "temporarily unavailable",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway",
+)
+
+
+def _is_transient_db_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(sig in msg for sig in _TRANSIENT_DB_SIGNATURES)
+
+
+def _execute_with_retry(build_query, *, label: str = "query"):
+    """Execute a Supabase query builder, retrying transient DB errors.
+
+    ``build_query`` is a zero-arg callable returning a *fresh* query builder on
+    each call (PostgREST builders are single-use). Non-transient errors raise
+    immediately; transient ones (statement timeout, dropped connection) are
+    retried up to ``DB_MAX_RETRIES`` with exponential backoff.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, DB_MAX_RETRIES + 1):
+        try:
+            return build_query().execute()
+        except Exception as e:
+            last_exc = e
+            if attempt >= DB_MAX_RETRIES or not _is_transient_db_error(e):
+                raise
+            sleep_s = DB_RETRY_BASE_SLEEP_SECS * (2 ** (attempt - 1))
+            print(
+                f"[db] transient error on {label} "
+                f"(attempt {attempt}/{DB_MAX_RETRIES}); retrying in {sleep_s:.0f}s: {e}"
+            )
+            time.sleep(sleep_s)
+    # Loop either returns or raises; this is defensive only.
+    raise last_exc  # type: ignore[misc]
 
 
 def get_latest_sitting(sb: Client) -> Optional[date]:
@@ -200,19 +257,28 @@ def upsert_all(
     # Upsert batches with explicit conflict targets
     try:
         for batch in chunk_records(_json_records(df_att_u), 500):
-            sb.table("hansard_attendance").upsert(batch, on_conflict="sitting_date,mp_name_raw").execute()
+            _execute_with_retry(
+                lambda b=batch: sb.table("hansard_attendance").upsert(b, on_conflict="sitting_date,mp_name_raw"),
+                label=f"hansard_attendance upsert ({sitting_iso})",
+            )
     except Exception as e:
         raise RuntimeError(f"Upsert failed for hansard_attendance ({sitting_iso}): {e}")
 
     try:
         for batch in chunk_records(_json_records(df_ptba_u), 500):
-            sb.table("hansard_ptba").upsert(batch, on_conflict="sitting_date,mp_name_raw,ptba_from,ptba_to").execute()
+            _execute_with_retry(
+                lambda b=batch: sb.table("hansard_ptba").upsert(b, on_conflict="sitting_date,mp_name_raw,ptba_from,ptba_to"),
+                label=f"hansard_ptba upsert ({sitting_iso})",
+            )
     except Exception as e:
         raise RuntimeError(f"Upsert failed for hansard_ptba ({sitting_iso}): {e}")
 
     def _upsert_speeches(df: pd.DataFrame):
         for batch in chunk_records(_json_records(df), 300):
-            sb.table("hansard_speeches").upsert(batch, on_conflict="sitting_date,row_num").execute()
+            _execute_with_retry(
+                lambda b=batch: sb.table("hansard_speeches").upsert(b, on_conflict="sitting_date,row_num"),
+                label=f"hansard_speeches upsert ({sitting_iso})",
+            )
 
     try:
         _upsert_speeches(df_speech_u)
@@ -258,10 +324,13 @@ def upsert_all(
             print(f"Stale speech cleanup skipped for {sitting_iso}: {e}")
 
     try:
-        sb.table("hansard_sittings").upsert(
-            {"sitting_date": sitting_iso, "source_url": source_url},
-            on_conflict="sitting_date",
-        ).execute()
+        _execute_with_retry(
+            lambda: sb.table("hansard_sittings").upsert(
+                {"sitting_date": sitting_iso, "source_url": source_url},
+                on_conflict="sitting_date",
+            ),
+            label=f"hansard_sittings upsert ({sitting_iso})",
+        )
     except Exception as e:
         raise RuntimeError(f"Upsert failed for hansard_sittings ({sitting_iso}): {e}")
 
@@ -272,7 +341,10 @@ def upsert_all(
             # Columns expected: sitting_date, provider, model, summary_3_sentences, updated_at
             # If your schema differs, adjust here.
             cleaned = scrub_records_for_json([ai_summary_row])[0]
-            sb.table("hansard_ai_summaries").upsert(cleaned, on_conflict="sitting_date").execute()
+            _execute_with_retry(
+                lambda: sb.table("hansard_ai_summaries").upsert(cleaned, on_conflict="sitting_date"),
+                label=f"hansard_ai_summaries upsert ({sitting_iso})",
+            )
         except Exception as e:
             # Don't fail ingestion if AI summary insert fails
             if DEBUG:
