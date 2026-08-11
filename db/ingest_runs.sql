@@ -36,26 +36,6 @@ CREATE TABLE IF NOT EXISTS hansard_ingest_runs (
   latest_sitting     date
 );
 
--- Generated column would be neater, but duration is derived on read to keep
--- the insert payload a plain dict from Python.
-CREATE OR REPLACE VIEW hansard_ingest_runs_recent AS
-  SELECT
-    id,
-    started_at,
-    EXTRACT(EPOCH FROM (finished_at - started_at))::int AS duration_seconds,
-    script_version,
-    range_start,
-    range_end,
-    days_scanned,
-    sittings_ingested,
-    no_sitting_days,
-    transient_failures,
-    hard_failures,
-    total_blackout,
-    latest_sitting
-  FROM hansard_ingest_runs
-  ORDER BY started_at DESC;
-
 CREATE INDEX IF NOT EXISTS idx_ingest_runs_started_at
   ON hansard_ingest_runs (started_at DESC);
 

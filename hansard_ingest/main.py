@@ -262,9 +262,8 @@ def ingest():
         days_scanned > 0 and successful_fetches == 0 and len(fetch_failures) > 0
     ) or control_probe_ok is False
 
-    run_log_id = None
     if LOG_RUNS and sb is not None:
-        run_log_id = insert_run_log(
+        insert_run_log(
             sb,
             {
                 "started_at": started_at.isoformat(),
@@ -299,5 +298,3 @@ def ingest():
         # Parse/DB/unexpected errors are real problems: exit non-zero so the
         # GitHub Action turns red and notifies the owner.
         sys.exit(1)
-
-    return run_log_id
