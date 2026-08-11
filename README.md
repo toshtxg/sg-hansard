@@ -119,15 +119,38 @@ for a starter file. Key variables:
 | `END_DATE`             | today                                    | ISO date                                                           |
 | `INGEST_LOOKBACK_DAYS` | `7`                                      | When `START_DATE` is unset, re-ingest this many days back from (and including) the latest sitting in Supabase. Retries transiently-failed days and picks up post-publication Hansard revisions; upserts are idempotent so this is safe |
 | `FETCH_SLEEP_SECS`     | `1`                                      | Politeness delay (seconds) between per-day fetches                 |
-| `MAX_DAYS_PER_RUN`     | `0` (disabled)                           | Safety cap per run (handy on Actions). Set to e.g. `30`            |
+| `MAX_DAYS_PER_RUN`     | `21`                                     | Safety cap per run (handy on Actions). Set to `0` to disable       |
 | `SKIP_DB`              | `false`                                  | Parse only, never call Supabase                                    |
 | `DEBUG`                | `false`                                  | Verbose logs + write per-sitting CSVs                              |
 | `SAVE_JSON`            | `false`                                  | When `DEBUG=true`, also dump raw API JSON to disk                  |
+| `LOG_RUNS`             | `true`                                   | Write one row per run to `hansard_ingest_runs` (needs `db/ingest_runs.sql` applied) |
+| `GIT_SHA`              | _unset_                                  | Commit recorded on the run row. CI passes `${{ github.sha }}`      |
 
-The fetch layer also retries transient HTTP errors (429/5xx) with exponential
-backoff, and the run ends with a one-line summary. If any day fails to fetch,
-parse, or upsert, the process exits non-zero so the GitHub Action turns red
-and notifies the owner. Non-sitting days (empty payloads) are not failures.
+The fetch layer retries transient HTTP errors (429, 502, 503, 504) with
+exponential backoff, and the run ends with a one-line summary. If any day fails
+to parse or upsert, the process exits non-zero so the GitHub Action turns red.
+
+### How a day is classified
+
+Upstream answers a date with no Hansard using **HTTP 500 and a JSON error
+envelope**, not an empty 200. Each scanned day therefore lands in one of three
+buckets, and the distinction matters:
+
+| Outcome           | Upstream response                      | Treated as                          |
+| ----------------- | -------------------------------------- | ----------------------------------- |
+| Sitting           | 200 with a payload                     | Parsed and upserted                 |
+| No sitting        | 500 with `{"errorCode":500,...}`       | `no_sitting_days` — normal, not a failure |
+| Upstream fault    | Anything else (429/502/503/504, HTML, timeout) | `transient_failures` — retried next run |
+
+That 500 is **not** retried: it is a settled answer, and retrying it previously
+cost around 30 seconds of backoff per recess day.
+
+Because the error envelope is generic, a single request cannot tell "no sitting
+today" from "upstream is broken". When a whole window comes back empty, the run
+re-queries one date already in `hansard_sittings` as a control. If that date
+still serves, the window was a recess; if it does not, the run is a blackout.
+This is what makes `ALERT_ON_TOTAL_BLACKOUT` safe to enable — the previous
+logic would have fired on every day of an ordinary recess.
 
 ### AI summaries (optional)
 
@@ -204,7 +227,8 @@ sg-hansard/
 ├── .github/workflows/
 │   └── hansard_ingest.yml         # Daily cron
 ├── db/
-│   └── dashboard_rpcs.sql         # Supabase RPCs + indexes for the dashboard
+│   ├── dashboard_rpcs.sql         # Supabase RPCs + indexes for the dashboard
+│   └── ingest_runs.sql            # Per-run audit table (hansard_ingest_runs)
 ├── hansard_ingest/                # Ingestion package
 │   ├── config.py                  # Env-driven configuration
 │   ├── fetch.py                   # HTTP fetch from the Parliament API

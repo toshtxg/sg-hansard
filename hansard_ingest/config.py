@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Bump when changing behaviour so logs make it clear which version ran.
-SCRIPT_VERSION = "2026-07-05.6"
+SCRIPT_VERSION = "2026-08-11.1"
 
 BASE_URL = "https://sprs.parl.gov.sg/search/getHansardReport/"
 
@@ -62,6 +62,15 @@ FETCH_SLEEP_SECS = env_int("FETCH_SLEEP_SECS", 1)
 # non-zero so the GitHub Action turns red. Off by default so ordinary transient
 # outages stay green; opt in to be paged on a sustained/permanent break.
 ALERT_ON_TOTAL_BLACKOUT = env_bool("ALERT_ON_TOTAL_BLACKOUT", False)
+
+# Write one row per run to hansard_ingest_runs. This is the pipeline's own
+# audit trail: without it a run that fetched nothing is indistinguishable from
+# a healthy one in the GitHub Actions UI, both being green ticks.
+LOG_RUNS = env_bool("LOG_RUNS", True)
+
+# Commit that produced the run, recorded alongside it. Supplied by CI as
+# ${{ github.sha }}; empty for local runs.
+GIT_SHA = env_str("GIT_SHA", "")
 
 # Supabase
 SUPABASE_URL = env_str("SUPABASE_URL", "")

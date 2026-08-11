@@ -25,6 +25,9 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Recorded on each hansard_ingest_runs row so a run can be traced
+          # back to the code that produced it.
+          GIT_SHA: ${{ github.sha }}
           DEBUG: "false"
           SAVE_JSON: "false"
           # Cap the rolling window at the most recent 21 days so a long recess
