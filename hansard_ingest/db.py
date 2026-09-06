@@ -122,6 +122,28 @@ def get_latest_sitting(sb: Client) -> Optional[date]:
     return None
 
 
+def insert_run_log(sb: Client, row: dict) -> None:
+    """Record one pipeline run in hansard_ingest_runs.
+
+    This is the only write a run makes when Parliament is in recess, so it is
+    also what keeps the Supabase project from being auto-paused for inactivity.
+    It is still best-effort: an ingest that fetched and stored real data must
+    not be marked failed because its audit row could not be written, so a
+    failure is printed loudly rather than raised.
+    """
+    try:
+        _execute_with_retry(
+            lambda: sb.table("hansard_ingest_runs").insert(row),
+            label="hansard_ingest_runs insert",
+        )
+    except Exception as e:
+        print(
+            f"WARNING: could not write run log to hansard_ingest_runs: {e}. "
+            "The run itself is unaffected, but this run will be missing from "
+            "the pipeline's audit trail."
+        )
+
+
 def ai_summary_exists(sb: Client, sitting_iso: str) -> bool:
     """Return True if hansard_ai_summaries already has a row for this date.
 

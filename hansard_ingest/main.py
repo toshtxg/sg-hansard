@@ -8,7 +8,7 @@ abort a long backfill window.
 
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 
@@ -20,6 +20,8 @@ from .config import (
     ALERT_ON_TOTAL_BLACKOUT,
     DEBUG,
     FETCH_SLEEP_SECS,
+    GIT_SHA,
+    LOG_RUNS,
     SAVE_JSON,
     END_DATE_ISO,
     INGEST_LOOKBACK_DAYS,
@@ -29,16 +31,26 @@ from .config import (
     SKIP_DB,
     START_DATE_ISO,
 )
-from .db import ai_summary_exists, get_latest_sitting, supabase_client, upsert_all
-from .fetch import fetch_hansard_json
+from .db import (
+    ai_summary_exists,
+    get_latest_sitting,
+    insert_run_log,
+    supabase_client,
+    upsert_all,
+)
+from .fetch import NoSittingReport, fetch_hansard_json, upstream_has_report
 from .parse import parse_one_sitting
 from .utils import ddmmyyyy_from_date, maybe_write_csv, maybe_write_json, parse_run_date
 
 
 def ingest():
+    started_at = datetime.now(timezone.utc)
     sb = None if SKIP_DB else supabase_client()
 
     today = date.today()
+
+    # Remembered for the blackout probe after the scan loop.
+    latest_known_sitting = None
 
     lookback_note = ""
     run_dt = parse_run_date(RUN_DATE)
@@ -55,6 +67,7 @@ def ingest():
         else:
             explicit_start = False
             latest = get_latest_sitting(sb) if sb is not None else None
+            latest_known_sitting = latest
             if latest:
                 # Re-ingest a rolling window ending at (and including) the latest
                 # sitting so transiently-failed days are retried and post-publication
@@ -85,7 +98,8 @@ def ingest():
 
     days_scanned = 0
     sittings_ingested = 0
-    successful_fetches = 0          # days upstream returned any payload (incl. empty non-sitting)
+    successful_fetches = 0          # days upstream answered definitively (report or "none")
+    no_sitting_days = 0             # days upstream confirmed hold no Hansard — recess, not failure
     fetch_failures: list[str] = []  # transient upstream (5xx/timeout) — self-heals, don't page
     hard_failures: list[str] = []   # parse/DB/unexpected — real problems that should page
 
@@ -96,6 +110,17 @@ def ingest():
 
         try:
             data = fetch_hansard_json(ddmmyyyy)
+        except NoSittingReport:
+            # Upstream answered definitively: no Hansard for this date. That is
+            # the normal state of most days, so it counts as a reachable day and
+            # never touches the parser (which requires a metadata block).
+            if DEBUG:
+                print(f"No report upstream for {ddmmyyyy}")
+            successful_fetches += 1
+            no_sitting_days += 1
+            d += timedelta(days=1)
+            time.sleep(FETCH_SLEEP_SECS)
+            continue
         except requests.exceptions.RequestException as e:
             # Transient upstream error (5xx after retries, timeout, connection
             # reset). The rolling lookback window retries these on the next run,
@@ -134,8 +159,11 @@ def ingest():
             maybe_write_csv(df_speech, f"speech_list_{ddmmyyyy}.csv")
 
         if len(df_att) == 0 and len(df_speech) == 0:
-            # Non-sitting day (empty payload) — expected, not a failure.
+            # Non-sitting day (payload present but empty) — expected, not a
+            # failure. Distinct from NoSittingReport above, which is upstream
+            # refusing the date outright; both mean "no sitting".
             print(f"No sitting detected for {ddmmyyyy}; skipping insert")
+            no_sitting_days += 1
             d += timedelta(days=1)
             time.sleep(FETCH_SLEEP_SECS)
             continue
@@ -182,7 +210,8 @@ def ingest():
     # ---- Run summary ----
     summary = (
         f"Run summary: days_scanned={days_scanned}, sittings_ingested={sittings_ingested}, "
-        f"upstream_failures={len(fetch_failures)}, hard_failures={len(hard_failures)}"
+        f"no_sitting_days={no_sitting_days}, upstream_failures={len(fetch_failures)}, "
+        f"hard_failures={len(hard_failures)}"
     )
     if hard_failures:
         summary += f" (hard: {', '.join(hard_failures)})"
@@ -198,18 +227,69 @@ def ingest():
         )
 
     # Optional backstop against a *permanent* upstream break (e.g. the endpoint
-    # moves) silently going green forever. A total blackout is a run that scanned
-    # days, had upstream failures, and got zero successful fetches — distinct from
-    # a recess, where fetches succeed but return empty payloads. Off by default
-    # (a normal transient outage would otherwise trip it); opt in via
-    # ALERT_ON_TOTAL_BLACKOUT once you want to be paged on a sustained blackout.
+    # moves) silently going green forever. Two shapes count as a blackout:
+    #
+    #   1. Every scanned day errored outright — nothing answered at all.
+    #   2. Every scanned day came back "no report" AND a date we have already
+    #      ingested now also comes back "no report". Upstream's empty response
+    #      is generic, so only re-asking a date with a known answer separates a
+    #      genuine recess from an endpoint that has started denying everything.
+    #
+    # Off by default (a normal transient outage would otherwise trip it); opt in
+    # via ALERT_ON_TOTAL_BLACKOUT once you want to be paged on a sustained break.
+    control_probe_ok = None
+    if days_scanned > 0 and sittings_ingested == 0 and no_sitting_days > 0:
+        control = latest_known_sitting
+        if control is None and sb is not None:
+            try:
+                control = get_latest_sitting(sb)
+            except Exception as e:
+                print(f"Blackout probe skipped (could not read latest sitting): {e}")
+        if control is not None:
+            control_probe_ok = upstream_has_report(ddmmyyyy_from_date(control))
+            if control_probe_ok:
+                print(
+                    f"Blackout probe: upstream still serves {control.isoformat()}, "
+                    "so the empty window is a recess, not an outage."
+                )
+            else:
+                print(
+                    f"Blackout probe: upstream reports no Hansard for {control.isoformat()}, "
+                    "a sitting already in the database — upstream is not answering correctly."
+                )
+
     total_blackout = (
         days_scanned > 0 and successful_fetches == 0 and len(fetch_failures) > 0
-    )
+    ) or control_probe_ok is False
+
+    if LOG_RUNS and sb is not None:
+        insert_run_log(
+            sb,
+            {
+                "started_at": started_at.isoformat(),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "script_version": SCRIPT_VERSION,
+                "git_sha": GIT_SHA or None,
+                "range_start": start_dt.isoformat(),
+                "range_end": end_dt.isoformat(),
+                "days_scanned": days_scanned,
+                "sittings_ingested": sittings_ingested,
+                "no_sitting_days": no_sitting_days,
+                "transient_failures": len(fetch_failures),
+                "hard_failures": len(hard_failures),
+                "hard_failure_dates": hard_failures or None,
+                "total_blackout": total_blackout,
+                "latest_sitting": (
+                    latest_known_sitting.isoformat() if latest_known_sitting else None
+                ),
+            },
+        )
+
     if ALERT_ON_TOTAL_BLACKOUT and total_blackout and not hard_failures:
         print(
-            "ALERT: total upstream blackout — every one of "
-            f"{days_scanned} scanned day(s) failed to fetch and none succeeded. "
+            "ALERT: total upstream blackout — "
+            f"{days_scanned} scanned day(s) yielded no Hansard and the control "
+            "probe confirmed upstream is not serving a sitting it holds. "
             "Upstream may be down or the endpoint may have changed."
         )
         sys.exit(1)
