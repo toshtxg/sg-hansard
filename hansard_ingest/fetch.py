@@ -48,7 +48,10 @@ def _build_session() -> requests.Session:
         # non-sitting day for a result that will never change. Genuine 500s
         # are re-scanned by the next run's rolling lookback window instead.
         status_forcelist=[429, 502, 503, 504],
-        allowed_methods=["GET"],
+        # urllib3 excludes POST by default because POST is not idempotent in
+        # general. This one is: it carries a read-only lookup that upstream
+        # moved from GET to POST, so retrying it is safe and worth opting into.
+        allowed_methods=["GET", "POST"],
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
@@ -73,15 +76,21 @@ def _is_no_report_envelope(r: requests.Response) -> bool:
 def fetch_hansard_json(sitting_ddmmyyyy: str) -> dict:
     """Fetch the raw Hansard JSON for a single sitting date.
 
-    The Parliament API expects ``DD-MM-YYYY``.
+    The Parliament API expects ``DD-MM-YYYY``, sent as a JSON body on a POST:
+    ``{"sittingDate": "04-08-2026"}``.
+
+    It previously served the same lookup as ``GET ?sittingDate=``. That form
+    was retired mid-August 2026 and now answers *every* date with the generic
+    500 envelope below — including sittings already in the database. Because
+    that envelope is also how upstream says "no sitting", the pipeline read a
+    dead endpoint as three weeks of recess and kept reporting success.
 
     Raises :class:`NoSittingReport` when upstream reports no Hansard for the
     date, and :class:`requests.exceptions.RequestException` for real transport
     or server faults. Callers must handle the two differently: the first is an
     ordinary recess day, the second is worth retrying.
     """
-    url = f"{BASE_URL}?sittingDate={sitting_ddmmyyyy}"
-    r = _SESSION.get(url, timeout=30)
+    r = _SESSION.post(BASE_URL, json={"sittingDate": sitting_ddmmyyyy}, timeout=30)
     if r.status_code == 500 and _is_no_report_envelope(r):
         raise NoSittingReport(sitting_ddmmyyyy)
     r.raise_for_status()

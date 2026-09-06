@@ -33,10 +33,12 @@ jobs:
           # Cap the rolling window at the most recent 21 days so a long recess
           # or an upstream outage can't balloon the run into hundreds of days.
           MAX_DAYS_PER_RUN: "21"
-          # Set to "true" to be paged (red job) when a run is a total upstream
-          # blackout (every scanned day failed to fetch). Left off so ordinary
-          # transient outages stay green; flip on to catch a permanent break.
-          ALERT_ON_TOTAL_BLACKOUT: "false"
+          # Red job when a run is a total upstream blackout: every scanned day
+          # empty *and* a date already in the database also reported empty.
+          # Turned on after the GET->POST retirement went unnoticed for three
+          # weeks of green ticks; the control probe makes this specific enough
+          # that an ordinary recess or transient outage won't trip it.
+          ALERT_ON_TOTAL_BLACKOUT: "true"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_ENABLED: "true"
           AI_PROVIDER: "openai"
