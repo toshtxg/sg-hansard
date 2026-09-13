@@ -5,7 +5,35 @@ on:
     # Daily 00:00 GMT+8 == 16:00 UTC (cron is UTC). Hansard data is published
     # next-day, and the ingest lookback window keeps daily runs cheap.
     - cron: "0 16 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    # Manual runs default to exactly what the cron does (every input blank).
+    # The date inputs exist because the rolling window cannot reach backwards:
+    # in auto mode a run scans the most recent MAX_DAYS_PER_RUN days, so once a
+    # date is older than that it is never revisited, whatever happened to it.
+    # After a silent upstream break (see PR #8) the days that fell out of the
+    # window during the outage are only recoverable by naming them here.
+    inputs:
+      start_date:
+        description: "Backfill window start, YYYY-MM-DD. Blank = normal rolling window."
+        required: false
+        default: ""
+      end_date:
+        description: "Backfill window end, YYYY-MM-DD. Blank = today."
+        required: false
+        default: ""
+      run_date:
+        description: "Single date to re-ingest, YYYY-MM-DD or DD-MM-YYYY. Overrides the window."
+        required: false
+        default: ""
+      max_days_per_run:
+        description: "Override the per-run day cap. 0 disables it. Blank = 21."
+        required: false
+        default: ""
+      skip_db:
+        description: "Parse only — scan upstream without writing to Supabase."
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: sg-hansard
@@ -30,9 +58,18 @@ jobs:
           GIT_SHA: ${{ github.sha }}
           DEBUG: "false"
           SAVE_JSON: "false"
+          # Blank on a scheduled run (the inputs context is empty for non-dispatch
+          # events), which is what config.py reads as "unset" — so the cron keeps
+          # resolving its own window from the latest sitting in Supabase.
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+          RUN_DATE: ${{ inputs.run_date }}
+          SKIP_DB: ${{ inputs.skip_db }}
           # Cap the rolling window at the most recent 21 days so a long recess
           # or an upstream outage can't balloon the run into hundreds of days.
-          MAX_DAYS_PER_RUN: "21"
+          # An explicit backfill marches forward from start_date instead, so a
+          # window longer than the cap needs this raised or set to 0.
+          MAX_DAYS_PER_RUN: ${{ inputs.max_days_per_run || '21' }}
           # Red job when a run is a total upstream blackout: every scanned day
           # empty *and* a date already in the database also reported empty.
           # Turned on after the GET->POST retirement went unnoticed for three
