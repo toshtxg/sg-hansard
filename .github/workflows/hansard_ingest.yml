@@ -5,7 +5,12 @@ on:
     # Daily 00:00 GMT+8 == 16:00 UTC (cron is UTC). Hansard data is published
     # next-day, and the ingest lookback window keeps daily runs cheap.
     - cron: "0 16 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: "Ingest one sitting date only (YYYY-MM-DD). Leave empty for the normal rolling window."
+        required: false
+        default: ""
 
 concurrency:
   group: sg-hansard
@@ -28,6 +33,9 @@ jobs:
           # Recorded on each hansard_ingest_runs row so a run can be traced
           # back to the code that produced it.
           GIT_SHA: ${{ github.sha }}
+          # Manual single-date re-ingest (e.g. a sitting that fell out of the
+          # lookback window after a failed run). Empty on scheduled runs.
+          RUN_DATE: ${{ inputs.run_date }}
           DEBUG: "false"
           SAVE_JSON: "false"
           # Cap the rolling window at the most recent 21 days so a long recess
