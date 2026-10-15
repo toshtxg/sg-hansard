@@ -53,20 +53,52 @@ $$ LANGUAGE sql STABLE;
 -- MP PROFILE RPCs
 -- =============================================================
 
+-- The MP list aggregates every row of hansard_speeches. Warm, that takes
+-- ~150ms; with a cold cache (e.g. after an ingest has churned the trigram
+-- indexes through shared_buffers) the same query took 8s, past anon's 3s
+-- statement_timeout, and /mp failed with 57014. The result is ~240 rows that
+-- only change when a sitting is ingested, so it is precomputed here and
+-- refreshed by the ingest via refresh_dashboard_cache() below.
+CREATE MATERIALIZED VIEW IF NOT EXISTS mp_list_mv AS
+  SELECT
+    mp_name_fuzzy_matched as mp_name,
+    SUM(word_count) as total_words,
+    COUNT(*) as total_speeches,
+    COUNT(DISTINCT sitting_date) as sittings_active,
+    MODE() WITHIN GROUP (ORDER BY section_type) as primary_section_type
+  FROM hansard_speeches
+  WHERE mp_name_fuzzy_matched IS NOT NULL
+  GROUP BY mp_name_fuzzy_matched;
+
+-- Required for REFRESH ... CONCURRENTLY, so dashboard reads never block on it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mp_list_mv_mp_name ON mp_list_mv (mp_name);
+
 CREATE OR REPLACE FUNCTION mp_list()
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY total_words DESC) FROM (
-    SELECT 
-      mp_name_fuzzy_matched as mp_name,
-      SUM(word_count) as total_words,
-      COUNT(*) as total_speeches,
-      COUNT(DISTINCT sitting_date) as sittings_active,
-      MODE() WITHIN GROUP (ORDER BY section_type) as primary_section_type
-    FROM hansard_speeches
-    WHERE mp_name_fuzzy_matched IS NOT NULL
-    GROUP BY mp_name_fuzzy_matched
+    SELECT mp_name, total_words, total_speeches, sittings_active, primary_section_type
+    FROM mp_list_mv
   ) r;
 $$ LANGUAGE sql STABLE;
+
+-- Called by the ingest (service_role) after it writes sittings. A
+-- materialized view can only be refreshed by its owner, hence SECURITY
+-- DEFINER; execute is limited to service_role. Returns the cached row count
+-- so the ingest can log it.
+CREATE OR REPLACE FUNCTION refresh_dashboard_cache()
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  REFRESH MATERIALIZED VIEW CONCURRENTLY mp_list_mv;
+  RETURN (SELECT COUNT(*) FROM mp_list_mv);
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION refresh_dashboard_cache() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION refresh_dashboard_cache() TO service_role;
 
 CREATE OR REPLACE FUNCTION mp_summary(p_mp_name text)
 RETURNS json AS $$
@@ -368,7 +400,7 @@ $$ LANGUAGE sql STABLE;
 -- require the service role key.
 -- =============================================================
 GRANT SELECT ON hansard_sittings, hansard_attendance, hansard_ptba,
-  hansard_speeches, hansard_ai_summaries TO anon;
+  hansard_speeches, hansard_ai_summaries, mp_list_mv TO anon;
 
 -- RLS read policies — the tables have Row Level Security enabled, and the
 -- RPCs run as the caller (SECURITY INVOKER), so anon needs an explicit

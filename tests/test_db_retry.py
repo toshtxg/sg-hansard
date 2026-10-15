@@ -75,3 +75,21 @@ def test_persistent_transient_error_exhausts_retries_then_raises(monkeypatch):
     except Exception as e:
         assert "statement timeout" in str(e)
     assert calls["n"] == db.DB_MAX_RETRIES
+
+
+def test_dashboard_cache_refresh_failure_does_not_raise(monkeypatch, capsys):
+    """The sitting is already stored when the refresh runs, so a failed
+    refresh must warn rather than turn the run red."""
+    _no_sleep(monkeypatch)
+
+    class Q:
+        def execute(self):
+            raise Exception("permission denied for function refresh_dashboard_cache")
+
+    class SB:
+        def rpc(self, name):
+            assert name == "refresh_dashboard_cache"
+            return Q()
+
+    db.refresh_dashboard_cache(SB())
+    assert "could not refresh dashboard cache" in capsys.readouterr().out
