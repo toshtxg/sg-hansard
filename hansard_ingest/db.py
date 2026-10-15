@@ -145,10 +145,11 @@ def insert_run_log(sb: Client, row: dict) -> None:
 
 
 def refresh_dashboard_cache(sb: Client) -> None:
-    """Rebuild the dashboard's precomputed aggregates (mp_list_mv).
+    """Rebuild the dashboard's precomputed aggregates (materialized views).
 
-    The MP list reads a materialized view rather than scanning
-    hansard_speeches per request, so it goes stale until this runs. Best-effort
+    The MP list, overview and trends RPCs read materialized views rather than
+    scanning hansard_speeches per request, so they go stale until this runs.
+    The RPC returns the mp_list_mv row count (number of MPs). Best-effort
     like the run log: the sitting data is already stored, and the next run
     that ingests a sitting will refresh again.
     """
@@ -161,7 +162,8 @@ def refresh_dashboard_cache(sb: Client) -> None:
     except Exception as e:
         print(
             f"WARNING: could not refresh dashboard cache: {e}. "
-            "The MP list will show data as of the last successful refresh."
+            "The MP list, overview and trends will show data as of the last "
+            "successful refresh."
         )
 
 
