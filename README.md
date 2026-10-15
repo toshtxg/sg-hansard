@@ -228,7 +228,8 @@ sg-hansard/
 │   └── hansard_ingest.yml         # Daily cron
 ├── db/
 │   ├── dashboard_rpcs.sql         # Supabase RPCs + indexes for the dashboard
-│   └── ingest_runs.sql            # Per-run audit table (hansard_ingest_runs)
+│   ├── ingest_runs.sql            # Per-run audit table (hansard_ingest_runs)
+│   └── ingest_write_timeout.sql   # 60s statement_timeout for the service_role writer
 ├── hansard_ingest/                # Ingestion package
 │   ├── config.py                  # Env-driven configuration
 │   ├── fetch.py                   # HTTP fetch from the Parliament API
