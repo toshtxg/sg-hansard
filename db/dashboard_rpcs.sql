@@ -21,52 +21,139 @@ CREATE INDEX IF NOT EXISTS idx_speeches_mp_name_trgm ON hansard_speeches USING g
 -- OVERVIEW RPCs
 -- =============================================================
 
+-- The overview and trends RPCs aggregate all of hansard_speeches, which is
+-- too slow for anon's 3s statement_timeout when the cache is cold (see
+-- mp_list_mv below). Their results only change when a sitting is ingested,
+-- so each is precomputed in a materialized view, refreshed by the ingest via
+-- refresh_dashboard_cache(). Each view has a unique index so it can be
+-- refreshed CONCURRENTLY without blocking dashboard reads.
+
+-- One row: the site-wide totals. id exists only to carry the unique index.
+CREATE MATERIALIZED VIEW IF NOT EXISTS overview_stats_mv AS
+  SELECT
+    1 as id,
+    sp.total_speeches,
+    st.total_sittings,
+    sp.total_speakers,
+    sp.total_words,
+    st.earliest_sitting,
+    st.latest_sitting
+  FROM (
+    SELECT
+      COUNT(*) as total_speeches,
+      COUNT(DISTINCT mp_name_fuzzy_matched) as total_speakers,
+      SUM(word_count) as total_words
+    FROM hansard_speeches
+  ) sp
+  CROSS JOIN (
+    SELECT
+      COUNT(*) as total_sittings,
+      MIN(sitting_date) as earliest_sitting,
+      MAX(sitting_date) as latest_sitting
+    FROM hansard_sittings
+  ) st;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_overview_stats_mv_id ON overview_stats_mv (id);
+
 CREATE OR REPLACE FUNCTION overview_stats()
 RETURNS json AS $$
   SELECT json_build_object(
-    'total_speeches', (SELECT COUNT(*) FROM hansard_speeches),
-    'total_sittings', (SELECT COUNT(*) FROM hansard_sittings),
-    'total_speakers', (SELECT COUNT(DISTINCT mp_name_fuzzy_matched) FROM hansard_speeches WHERE mp_name_fuzzy_matched IS NOT NULL),
-    'total_words', (SELECT SUM(word_count) FROM hansard_speeches),
-    'earliest_sitting', (SELECT MIN(sitting_date) FROM hansard_sittings),
-    'latest_sitting', (SELECT MAX(sitting_date) FROM hansard_sittings)
-  );
+    'total_speeches', total_speeches,
+    'total_sittings', total_sittings,
+    'total_speakers', total_speakers,
+    'total_words', total_words,
+    'earliest_sitting', earliest_sitting,
+    'latest_sitting', latest_sitting
+  )
+  FROM overview_stats_mv;
 $$ LANGUAGE sql STABLE;
+
+-- Speech and word totals per sitting. The AI summary is not cached here: it
+-- is joined at read time (a PK lookup per returned sitting), so it shows up
+-- as soon as it is written.
+CREATE MATERIALIZED VIEW IF NOT EXISTS sitting_stats_mv AS
+  SELECT s.sitting_date, s.source_url,
+    COUNT(sp.row_num) as speech_count,
+    COALESCE(SUM(sp.word_count), 0) as word_count
+  FROM hansard_sittings s
+  LEFT JOIN hansard_speeches sp ON s.sitting_date = sp.sitting_date
+  GROUP BY s.sitting_date, s.source_url;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sitting_stats_mv_sitting_date ON sitting_stats_mv (sitting_date);
 
 CREATE OR REPLACE FUNCTION recent_sittings(p_limit int DEFAULT 10)
 RETURNS json AS $$
   SELECT json_agg(r) FROM (
-    SELECT s.sitting_date, s.source_url,
-      COUNT(sp.row_num) as speech_count,
-      COALESCE(SUM(sp.word_count), 0) as word_count,
+    SELECT m.sitting_date, m.source_url, m.speech_count, m.word_count,
       ai.summary_3_sentences
-    FROM hansard_sittings s
-    LEFT JOIN hansard_speeches sp ON s.sitting_date = sp.sitting_date
-    LEFT JOIN hansard_ai_summaries ai ON s.sitting_date = ai.sitting_date
-    GROUP BY s.sitting_date, s.source_url, ai.summary_3_sentences
-    ORDER BY s.sitting_date DESC
+    FROM sitting_stats_mv m
+    LEFT JOIN hansard_ai_summaries ai ON m.sitting_date = ai.sitting_date
+    ORDER BY m.sitting_date DESC
     LIMIT p_limit
   ) r;
 $$ LANGUAGE sql STABLE;
+
+GRANT SELECT ON overview_stats_mv, sitting_stats_mv TO anon;
 
 -- =============================================================
 -- MP PROFILE RPCs
 -- =============================================================
 
+-- The MP list aggregates every row of hansard_speeches. Warm, that takes
+-- ~150ms; with a cold cache (e.g. after an ingest has churned the trigram
+-- indexes through shared_buffers) the same query took 8s, past anon's 3s
+-- statement_timeout, and /mp failed with 57014. The result is ~240 rows that
+-- only change when a sitting is ingested, so it is precomputed here and
+-- refreshed by the ingest via refresh_dashboard_cache() below.
+CREATE MATERIALIZED VIEW IF NOT EXISTS mp_list_mv AS
+  SELECT
+    mp_name_fuzzy_matched as mp_name,
+    SUM(word_count) as total_words,
+    COUNT(*) as total_speeches,
+    COUNT(DISTINCT sitting_date) as sittings_active,
+    MODE() WITHIN GROUP (ORDER BY section_type) as primary_section_type
+  FROM hansard_speeches
+  WHERE mp_name_fuzzy_matched IS NOT NULL
+  GROUP BY mp_name_fuzzy_matched;
+
+-- Required for REFRESH ... CONCURRENTLY, so dashboard reads never block on it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mp_list_mv_mp_name ON mp_list_mv (mp_name);
+
 CREATE OR REPLACE FUNCTION mp_list()
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY total_words DESC) FROM (
-    SELECT 
-      mp_name_fuzzy_matched as mp_name,
-      SUM(word_count) as total_words,
-      COUNT(*) as total_speeches,
-      COUNT(DISTINCT sitting_date) as sittings_active,
-      MODE() WITHIN GROUP (ORDER BY section_type) as primary_section_type
-    FROM hansard_speeches
-    WHERE mp_name_fuzzy_matched IS NOT NULL
-    GROUP BY mp_name_fuzzy_matched
+    SELECT mp_name, total_words, total_speeches, sittings_active, primary_section_type
+    FROM mp_list_mv
   ) r;
 $$ LANGUAGE sql STABLE;
+
+-- Called by the ingest (service_role) after it writes sittings. A
+-- materialized view can only be refreshed by its owner, hence SECURITY
+-- DEFINER; execute is limited to service_role. Refreshes every dashboard
+-- materialized view: mp_list_mv here, the overview views in the OVERVIEW
+-- section and the trends views in the TRENDS section (the views need not
+-- exist when this function is created, only when it runs). Returns the
+-- mp_list_mv row count (the number of MPs) so the ingest can log it.
+CREATE OR REPLACE FUNCTION refresh_dashboard_cache()
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  REFRESH MATERIALIZED VIEW CONCURRENTLY mp_list_mv;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY overview_stats_mv;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY sitting_stats_mv;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY trends_volume_mv;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY trends_parliament_mv;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY trends_sitting_intensity_mv;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY trends_speaker_diversity_mv;
+  RETURN (SELECT COUNT(*) FROM mp_list_mv);
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION refresh_dashboard_cache() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION refresh_dashboard_cache() TO service_role;
 
 CREATE OR REPLACE FUNCTION mp_summary(p_mp_name text)
 RETURNS json AS $$
@@ -206,70 +293,110 @@ $$ LANGUAGE sql STABLE;
 -- TRENDS RPCs
 -- =============================================================
 
+-- Like the overview, the trends RPCs read precomputed materialized views
+-- (refreshed by refresh_dashboard_cache()). The per-period views hold one
+-- set of rows per granularity ('year' and 'quarter') because COUNT(DISTINCT)
+-- does not roll up from quarters to years. The RPCs keep their old contract:
+-- p_granularity = 'year' gives years, any other value (or NULL) quarters.
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS trends_volume_mv AS
+  SELECT
+    g.granularity,
+    date_trunc(g.granularity, sitting_date)::date::text as period,
+    section_type,
+    COUNT(*) as speech_count,
+    SUM(word_count) as word_count
+  FROM hansard_speeches
+  CROSS JOIN (VALUES ('year'), ('quarter')) g(granularity)
+  GROUP BY g.granularity, period, section_type;
+
+-- section_type is nullable; a NULL key is still refreshed correctly (that
+-- row is just rewritten on every refresh), and there are none today.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trends_volume_mv_key
+  ON trends_volume_mv (granularity, period, section_type);
+
 CREATE OR REPLACE FUNCTION trends_volume_over_time(p_granularity text DEFAULT 'quarter', p_section_type text DEFAULT NULL)
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY period, section_type) FROM (
-    SELECT 
-      CASE WHEN p_granularity = 'year' 
-        THEN date_trunc('year', sitting_date)::date::text
-        ELSE date_trunc('quarter', sitting_date)::date::text
-      END as period,
-      section_type,
-      COUNT(*) as speech_count,
-      SUM(word_count) as word_count
-    FROM hansard_speeches
-    WHERE (p_section_type IS NULL OR section_type = p_section_type)
-    GROUP BY period, section_type
+    SELECT period, section_type, speech_count, word_count
+    FROM trends_volume_mv
+    WHERE granularity = CASE WHEN p_granularity = 'year' THEN 'year' ELSE 'quarter' END
+      AND (p_section_type IS NULL OR section_type = p_section_type)
   ) r;
 $$ LANGUAGE sql STABLE;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS trends_parliament_mv AS
+  SELECT
+    parliament_no,
+    MIN(sitting_date)::text || ' to ' || MAX(sitting_date)::text as date_range,
+    COUNT(DISTINCT sitting_date) as total_sittings,
+    COUNT(*) as total_speeches,
+    COUNT(DISTINCT mp_name_fuzzy_matched) as total_speakers,
+    ROUND(COUNT(*)::numeric / NULLIF(COUNT(DISTINCT sitting_date), 0), 1) as avg_speeches_per_sitting
+  FROM hansard_speeches
+  WHERE parliament_no IS NOT NULL
+  GROUP BY parliament_no;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trends_parliament_mv_parliament_no
+  ON trends_parliament_mv (parliament_no);
 
 CREATE OR REPLACE FUNCTION trends_parliament_summary()
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY parliament_no) FROM (
-    SELECT 
-      parliament_no,
-      MIN(sitting_date)::text || ' to ' || MAX(sitting_date)::text as date_range,
-      COUNT(DISTINCT sitting_date) as total_sittings,
-      COUNT(*) as total_speeches,
-      COUNT(DISTINCT mp_name_fuzzy_matched) as total_speakers,
-      ROUND(COUNT(*)::numeric / NULLIF(COUNT(DISTINCT sitting_date), 0), 1) as avg_speeches_per_sitting
-    FROM hansard_speeches
-    WHERE parliament_no IS NOT NULL
-    GROUP BY parliament_no
+    SELECT parliament_no, date_range, total_sittings, total_speeches,
+      total_speakers, avg_speeches_per_sitting
+    FROM trends_parliament_mv
   ) r;
 $$ LANGUAGE sql STABLE;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS trends_sitting_intensity_mv AS
+  SELECT
+    g.granularity,
+    date_trunc(g.granularity, s.sitting_date)::date::text as period,
+    COUNT(DISTINCT s.sitting_date) as sitting_count,
+    ROUND(COALESCE(SUM(sp.word_count), 0)::numeric / NULLIF(COUNT(DISTINCT s.sitting_date), 0), 0) as avg_words_per_sitting
+  FROM hansard_sittings s
+  LEFT JOIN hansard_speeches sp ON s.sitting_date = sp.sitting_date
+  CROSS JOIN (VALUES ('year'), ('quarter')) g(granularity)
+  GROUP BY g.granularity, period;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trends_sitting_intensity_mv_key
+  ON trends_sitting_intensity_mv (granularity, period);
 
 CREATE OR REPLACE FUNCTION trends_sitting_intensity(p_granularity text DEFAULT 'year')
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY period) FROM (
-    SELECT 
-      CASE WHEN p_granularity = 'year' 
-        THEN date_trunc('year', s.sitting_date)::date::text
-        ELSE date_trunc('quarter', s.sitting_date)::date::text
-      END as period,
-      COUNT(DISTINCT s.sitting_date) as sitting_count,
-      ROUND(COALESCE(SUM(sp.word_count), 0)::numeric / NULLIF(COUNT(DISTINCT s.sitting_date), 0), 0) as avg_words_per_sitting
-    FROM hansard_sittings s
-    LEFT JOIN hansard_speeches sp ON s.sitting_date = sp.sitting_date
-    GROUP BY period
+    SELECT period, sitting_count, avg_words_per_sitting
+    FROM trends_sitting_intensity_mv
+    WHERE granularity = CASE WHEN p_granularity = 'year' THEN 'year' ELSE 'quarter' END
   ) r;
 $$ LANGUAGE sql STABLE;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS trends_speaker_diversity_mv AS
+  SELECT
+    g.granularity,
+    date_trunc(g.granularity, sitting_date)::date::text as period,
+    COUNT(DISTINCT mp_name_fuzzy_matched) as unique_speakers,
+    ROUND(SUM(word_count)::numeric / NULLIF(COUNT(DISTINCT mp_name_fuzzy_matched), 0), 0) as avg_words_per_speaker
+  FROM hansard_speeches
+  CROSS JOIN (VALUES ('year'), ('quarter')) g(granularity)
+  WHERE mp_name_fuzzy_matched IS NOT NULL
+  GROUP BY g.granularity, period;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trends_speaker_diversity_mv_key
+  ON trends_speaker_diversity_mv (granularity, period);
 
 CREATE OR REPLACE FUNCTION trends_speaker_diversity(p_granularity text DEFAULT 'year')
 RETURNS json AS $$
   SELECT json_agg(r ORDER BY period) FROM (
-    SELECT
-      CASE WHEN p_granularity = 'year'
-        THEN date_trunc('year', sitting_date)::date::text
-        ELSE date_trunc('quarter', sitting_date)::date::text
-      END as period,
-      COUNT(DISTINCT mp_name_fuzzy_matched) as unique_speakers,
-      ROUND(SUM(word_count)::numeric / NULLIF(COUNT(DISTINCT mp_name_fuzzy_matched), 0), 0) as avg_words_per_speaker
-    FROM hansard_speeches
-    WHERE mp_name_fuzzy_matched IS NOT NULL
-    GROUP BY period
+    SELECT period, unique_speakers, avg_words_per_speaker
+    FROM trends_speaker_diversity_mv
+    WHERE granularity = CASE WHEN p_granularity = 'year' THEN 'year' ELSE 'quarter' END
   ) r;
 $$ LANGUAGE sql STABLE;
+
+GRANT SELECT ON trends_volume_mv, trends_parliament_mv,
+  trends_sitting_intensity_mv, trends_speaker_diversity_mv TO anon;
 
 -- =============================================================
 -- 2026 ADDITIONS: sitting detail, MP attendance, AI summaries
@@ -368,7 +495,7 @@ $$ LANGUAGE sql STABLE;
 -- require the service role key.
 -- =============================================================
 GRANT SELECT ON hansard_sittings, hansard_attendance, hansard_ptba,
-  hansard_speeches, hansard_ai_summaries TO anon;
+  hansard_speeches, hansard_ai_summaries, mp_list_mv TO anon;
 
 -- RLS read policies — the tables have Row Level Security enabled, and the
 -- RPCs run as the caller (SECURITY INVOKER), so anon needs an explicit

@@ -35,6 +35,7 @@ from .db import (
     ai_summary_exists,
     get_latest_sitting,
     insert_run_log,
+    refresh_dashboard_cache,
     supabase_client,
     upsert_all,
 )
@@ -206,6 +207,9 @@ def ingest():
 
         d += timedelta(days=1)
         time.sleep(FETCH_SLEEP_SECS)
+
+    if sb is not None and sittings_ingested > 0:
+        refresh_dashboard_cache(sb)
 
     # ---- Run summary ----
     summary = (

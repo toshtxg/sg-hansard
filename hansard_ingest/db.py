@@ -144,6 +144,29 @@ def insert_run_log(sb: Client, row: dict) -> None:
         )
 
 
+def refresh_dashboard_cache(sb: Client) -> None:
+    """Rebuild the dashboard's precomputed aggregates (materialized views).
+
+    The MP list, overview and trends RPCs read materialized views rather than
+    scanning hansard_speeches per request, so they go stale until this runs.
+    The RPC returns the mp_list_mv row count (number of MPs). Best-effort
+    like the run log: the sitting data is already stored, and the next run
+    that ingests a sitting will refresh again.
+    """
+    try:
+        resp = _execute_with_retry(
+            lambda: sb.rpc("refresh_dashboard_cache"),
+            label="refresh_dashboard_cache",
+        )
+        print(f"Dashboard cache refreshed: mp_list_mv rows={resp.data}")
+    except Exception as e:
+        print(
+            f"WARNING: could not refresh dashboard cache: {e}. "
+            "The MP list, overview and trends will show data as of the last "
+            "successful refresh."
+        )
+
+
 def ai_summary_exists(sb: Client, sitting_iso: str) -> bool:
     """Return True if hansard_ai_summaries already has a row for this date.
 

@@ -10,7 +10,7 @@ from datetime import datetime
 
 from hansard_ingest.ai_summary import generate_ai_summary
 from hansard_ingest.config import AI_DRY_RUN, AI_ENABLED, DEBUG, SAVE_JSON, SKIP_DB, SCRIPT_VERSION
-from hansard_ingest.db import supabase_client, upsert_all
+from hansard_ingest.db import refresh_dashboard_cache, supabase_client, upsert_all
 from hansard_ingest.fetch import fetch_hansard_json
 from hansard_ingest.parse import parse_one_sitting
 from hansard_ingest.utils import ddmmyyyy_from_date, maybe_write_csv, maybe_write_json
@@ -74,6 +74,8 @@ def main() -> None:
             print(f"Inserted {ddmmyyyy}: att={len(df_att)} ptba={len(df_ptba)} speech={len(df_speech)}")
         except Exception as e:
             print(f"DB insert failed for {ddmmyyyy}: {e}")
+
+    refresh_dashboard_cache(sb)
 
 
 if __name__ == "__main__":
